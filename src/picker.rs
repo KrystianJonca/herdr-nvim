@@ -50,7 +50,7 @@ const AMBER: Color = Color::Rgb {
 pub struct Handoff {
     pub candidates: Vec<Candidate>,
     /// Indices into `candidates`, written back by the picker: one on Enter,
-    /// up to 100 matches on Ctrl-o. The first is shown in the sidebar; the
+    /// up to 100 agent-touched matches on Ctrl-o. The first is shown in the sidebar; the
     /// rest are added to the buffer list. Empty means nothing was picked.
     pub chosen: Vec<usize>,
     pub workspace: String,
@@ -331,9 +331,15 @@ pub fn scroll_window(cursor: usize, total: usize, viewport_rows: usize) -> (usiz
 const OPEN_ALL_CAP: usize = 100;
 
 /// The Ctrl-o selection: the row under `cursor` first (it is the one shown),
-/// then the other matches in order, including ones past the `max_files` rows
-/// the view shows, capped to `cap`. Pure, unit tested.
-pub fn open_all_selection(matches: &[FilterMatch], cursor: usize, cap: usize) -> Vec<usize> {
+/// then the other session (agent-touched) matches in order, including ones
+/// past the `max_files` rows the view shows, capped to `cap`. Repo-wide
+/// matches a query pulls in are never added. Pure, unit tested.
+pub fn open_all_selection(
+    cands: &[Candidate],
+    matches: &[FilterMatch],
+    cursor: usize,
+    cap: usize,
+) -> Vec<usize> {
     let Some(current) = matches.get(cursor) else {
         return Vec::new();
     };
@@ -342,9 +348,9 @@ pub fn open_all_selection(matches: &[FilterMatch], cursor: usize, cap: usize) ->
             matches
                 .iter()
                 .map(|m| m.index)
-                .filter(|&index| index != current.index),
+                .filter(|&index| index != current.index && cands[index].session),
         )
-        .take(cap.max(1))
+        .take(cap)
         .collect()
 }
 
@@ -487,7 +493,7 @@ fn run_overlay(
             // `k` swallowed by nav).
             KeyCode::Char('c') if ctrl => return Ok(Vec::new()),
             KeyCode::Char('o') if ctrl => {
-                return Ok(open_all_selection(&matches, cursor, OPEN_ALL_CAP))
+                return Ok(open_all_selection(cands, &matches, cursor, OPEN_ALL_CAP))
             }
             KeyCode::Char('p') if ctrl => cursor = cursor.saturating_sub(1),
             KeyCode::Char('n') if ctrl => cursor = (cursor + 1).min(last),
@@ -847,30 +853,53 @@ mod tests {
             .collect()
     }
 
+    fn session_cands(count: usize) -> Vec<Candidate> {
+        (0..count).map(|i| cand(&format!("/r/f{i}.rs"))).collect()
+    }
+
     #[test]
     fn open_all_puts_the_cursor_row_first_then_the_rest_in_order() {
         assert_eq!(
-            open_all_selection(&rows(&[4, 7, 2, 9]), 2, 20),
+            open_all_selection(&session_cands(10), &rows(&[4, 7, 2, 9]), 2, 20),
             [2, 4, 7, 9]
         );
     }
 
     #[test]
     fn open_all_is_capped() {
-        assert_eq!(open_all_selection(&rows(&[4, 7, 2, 9]), 3, 2), [9, 4]);
+        assert_eq!(
+            open_all_selection(&session_cands(10), &rows(&[4, 7, 2, 9]), 3, 2),
+            [9, 4]
+        );
     }
 
     #[test]
     fn open_all_reaches_past_the_rows_the_default_view_shows() {
-        let cands: Vec<Candidate> = (0..30).map(|i| cand(&format!("/r/f{i}.rs"))).collect();
+        let cands = session_cands(30);
         let matches = default_view(&cands);
         assert_eq!(visible_count(matches.len(), "", 20), 20);
-        assert_eq!(open_all_selection(&matches, 0, OPEN_ALL_CAP).len(), 30);
+        assert_eq!(
+            open_all_selection(&cands, &matches, 0, OPEN_ALL_CAP).len(),
+            30
+        );
+    }
+
+    #[test]
+    fn open_all_skips_repo_wide_matches_but_keeps_a_highlighted_one() {
+        let cands = vec![
+            cand("/r/touched.rs"),
+            repo_cand("/r/untouched.rs"),
+            cand("/r/also-touched.rs"),
+            repo_cand("/r/highlighted.rs"),
+        ];
+        let matches = rows(&[0, 1, 2, 3]);
+        assert_eq!(open_all_selection(&cands, &matches, 0, 20), [0, 2]);
+        assert_eq!(open_all_selection(&cands, &matches, 3, 20), [3, 0, 2]);
     }
 
     #[test]
     fn open_all_on_an_empty_list_picks_nothing() {
-        assert!(open_all_selection(&[], 0, 20).is_empty());
+        assert!(open_all_selection(&[], &[], 0, 20).is_empty());
     }
 
     // --- fuzzy_match ------------------------------------------------------

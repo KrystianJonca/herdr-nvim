@@ -244,10 +244,16 @@ fn finish_pick(handoff_path: &str) -> Result<()> {
             .with_context(|| format!("handoff chosen index {index} out of range"))
     };
     let candidate = candidate_at(chosen)?;
-    let background = rest
+    let background: Vec<_> = rest
         .iter()
-        .map(|&index| candidate_at(index).map(|c| (c.path.clone(), c.line)))
-        .collect::<Result<Vec<_>>>()?;
+        .filter_map(|&index| match candidate_at(index) {
+            Ok(c) => Some((c.path.clone(), c.line)),
+            Err(error) => {
+                eprintln!("herdr-nvim: {error:#}");
+                None
+            }
+        })
+        .collect();
 
     let ctx = Ctx {
         workspace: handoff.workspace.clone(),
@@ -366,12 +372,17 @@ fn open_in_nvim(
     Ok(())
 }
 
-/// Vimscript expression that runs `:badd [+line] <path>` for every path.
-/// `:badd` lists a buffer without reading the file (nvim reads it on first
-/// visit, landing on `line`) and skips paths already listed, so files the
-/// daemon already has open are left alone. Paths go in as Vimscript string
-/// literals and through `fnameescape()`, so spaces and specials need no
-/// escaping here. Pure, unit tested.
+/// Runs each command in its own `pcall`, so one failure (say, an exception
+/// from a user's `BufAdd` autocmd) never stops the rest, and returns the
+/// failures' messages joined by newlines, or "" when every command ran.
+const PCALL_EACH_LUA: &str = "(function(cmds) local failed = {} for _, c in ipairs(cmds) do local ok, err = pcall(vim.cmd, c) if not ok then table.insert(failed, err) end end return table.concat(failed, \"\\n\") end)(_A)";
+
+/// Expression that runs `:badd [+line] <path>` for every path through
+/// [`PCALL_EACH_LUA`]. `:badd` lists a buffer without reading the file (nvim
+/// reads it on first visit, landing on `line`) and skips paths already
+/// listed, so files the daemon already has open are left alone. Paths go in
+/// as Vimscript string literals and through `fnameescape()`, so spaces and
+/// specials need no escaping here. Pure, unit tested.
 fn badd_expr(paths: &[(String, Option<u32>)]) -> String {
     let commands = paths
         .iter()
@@ -384,11 +395,15 @@ fn badd_expr(paths: &[(String, Option<u32>)]) -> String {
         })
         .collect::<Vec<_>>()
         .join(", ");
-    format!("execute([{commands}])")
+    format!(
+        "luaeval({}, [{commands}])",
+        daemon::vim_string_literal(PCALL_EACH_LUA)
+    )
 }
 
 /// Add `paths` to the daemon's buffer list in one round trip, without changing
-/// the current window. A no-op for an empty list.
+/// the current window. A no-op for an empty list. Errors name every path nvim
+/// rejected; the others are still added.
 fn add_buffers(
     socket: &Path,
     paths: &[(String, Option<u32>)],
@@ -397,9 +412,12 @@ fn add_buffers(
     if paths.is_empty() {
         return Ok(());
     }
-    daemon::remote_expr(socket, &badd_expr(paths), sidebar)
-        .map(|_| ())
-        .with_context(|| format!("failed to add {} buffers to the sidebar", paths.len()))
+    let failed = daemon::remote_expr(socket, &badd_expr(paths), sidebar)
+        .with_context(|| format!("failed to add {} buffers to the sidebar", paths.len()))?;
+    if !failed.is_empty() {
+        bail!("some buffers were not added to the sidebar:\n{failed}");
+    }
+    Ok(())
 }
 
 /// Focus the sidebar pane so the user lands in nvim. Best-effort: the file is
@@ -598,7 +616,42 @@ mod tests {
                 ("/r/a.rs".into(), None),
                 ("/r/it's here.md".into(), Some(12))
             ]),
-            "execute(['badd ' .. fnameescape('/r/a.rs'), 'badd +12 ' .. fnameescape('/r/it''s here.md')])"
+            format!(
+                "luaeval({}, ['badd ' .. fnameescape('/r/a.rs'), 'badd +12 ' .. fnameescape('/r/it''s here.md')])",
+                daemon::vim_string_literal(PCALL_EACH_LUA)
+            )
+        );
+    }
+
+    #[test]
+    fn add_buffers_keeps_going_past_a_failing_path_and_reports_it() {
+        if !nvim_available() {
+            eprintln!("skipping: nvim not found on PATH");
+            return;
+        }
+        let env = TestEnv::new();
+        let config = Config::default();
+        let daemon = TestDaemon::spawn("w41:t1", &config);
+        let paths: Vec<(String, Option<u32>)> = ["broken.rs", "fine.rs"]
+            .iter()
+            .map(|name| {
+                let path = env.dir.join(name);
+                std::fs::write(&path, "").unwrap();
+                (path.to_string_lossy().into_owned(), None)
+            })
+            .collect();
+        daemon.eval(r#"execute('autocmd BufAdd */broken.rs throw "boom"')"#);
+
+        let error = add_buffers(&daemon.socket, &paths, &config.sidebar).unwrap_err();
+
+        assert!(format!("{error:#}").contains("boom"), "{error:#}");
+        assert_eq!(
+            daemon.eval(&format!(
+                "buflisted(bufnr({}))",
+                daemon::vim_string_literal(&paths[1].0)
+            )),
+            "1",
+            "fine.rs must still be added"
         );
     }
 
